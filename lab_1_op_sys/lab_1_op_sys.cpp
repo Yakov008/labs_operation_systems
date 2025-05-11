@@ -1,68 +1,137 @@
-
 #include <windows.h>
 #include <iostream>
 #include <string>
+#include <vector>
+
+struct SharedData {
+    int input;
+    unsigned long long result;
+    bool data_ready;
+    bool result_ready;
+    bool exit_flag;
+};
 
 unsigned long long factorial(int n) {
     if (n <= 1) return 1;
     return n * factorial(n - 1);
 }
-
 // Функция для работы дочернего процесса
 DWORD WINAPI child_process(LPVOID lpParam) {
-    HANDLE hMapFile = (HANDLE)lpParam;
-    // Получаем указатель на разделяемую память
-    unsigned long long* pBuf = (unsigned long long*)MapViewOfFile(hMapFile, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(unsigned long long));
-    if (pBuf == NULL) {
-        std::cerr << "Could not map view of file: " << GetLastError() << std::endl;
-        CloseHandle(hMapFile);
-        return 1;
+    SharedData* shared = (SharedData*)lpParam;
+    HANDLE hMutex = OpenMutexW(MUTEX_ALL_ACCESS, FALSE, L"FactorialMutex");
+
+    while (true) {
+        WaitForSingleObject(hMutex, INFINITE);
+
+        if (shared->exit_flag) {
+            ReleaseMutex(hMutex);
+            break;
+        }
+
+        if (shared->data_ready && !shared->result_ready) {
+            shared->result = factorial(shared->input);
+            shared->data_ready = false;
+            shared->result_ready = true;
+        }
+
+        ReleaseMutex(hMutex);
+        Sleep(10); // Небольшая пауза для уменьшения нагрузки на CPU
     }
-    // Вычисляем факториал (в этом примере просто число 5)
-    *pBuf = factorial(5);
-    // Освобождаем ресурсы
-    UnmapViewOfFile(pBuf);
+
+    CloseHandle(hMutex);
     return 0;
 }
 
-int main(int argc, char* argv[]) {
-    if (argc != 2) {
-        std::cerr << "Usage: " << argv[0] << " <number>" << std::endl;
+int main() {
+    // Создаем мьютекс для синхронизации
+    HANDLE hMutex = CreateMutexW(NULL, FALSE, L"FactorialMutex");
+    if (hMutex == NULL) {
+        std::cerr << "CreateMutex failed: " << GetLastError() << std::endl;
         return 1;
     }
-    int num = atoi(argv[1]);
-    if (num < 0) {
-        std::cerr << "Number must be non-negative" << std::endl;
-        return 1;
-    }
+
     // Создаем разделяемую память
-    HANDLE hMapFile = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, sizeof(unsigned long long), L"FactorialSharedMemory");
+    HANDLE hMapFile = CreateFileMappingW(INVALID_HANDLE_VALUE,NULL,PAGE_READWRITE,0,sizeof(SharedData),L"FactorialSharedMemory");
 
     if (hMapFile == NULL) {
-        std::cerr << "Could not create file mapping object: " << GetLastError() << std::endl;
+        std::cerr << "CreateFileMapping failed: " << GetLastError() << std::endl;
+        CloseHandle(hMutex);
         return 1;
     }
-    // Создаем дочерний поток
-    HANDLE hThread = CreateThread(NULL, 0, child_process, hMapFile, 0, NULL);
 
-    if (hThread == NULL) {
-        std::cerr << "CreateThread failed: " << GetLastError() << std::endl;
+    SharedData* shared = (SharedData*)MapViewOfFile(hMapFile,FILE_MAP_ALL_ACCESS,0,0,sizeof(SharedData));
+
+    if (shared == NULL) {
+        std::cerr << "MapViewOfFile failed: " << GetLastError() << std::endl;
         CloseHandle(hMapFile);
+        CloseHandle(hMutex);
         return 1;
     }
-    // Ждем завершения дочернего потока
-    WaitForSingleObject(hThread, INFINITE);
-    // Читаем результат из разделяемой памяти
-    unsigned long long* pBuf = (unsigned long long*)MapViewOfFile(hMapFile, FILE_MAP_READ, 0, 0, sizeof(unsigned long long));
-    if (pBuf == NULL) {
-        std::cerr << "Could not map view of file: " << GetLastError() << std::endl;
+
+    // Инициализация разделяемых данных
+    shared->data_ready = false;
+    shared->result_ready = false;
+    shared->exit_flag = false;
+
+    // Создаем дочерний процесс
+    STARTUPINFO si = { sizeof(si) };
+    PROCESS_INFORMATION pi;
+
+    if (!CreateProcess(NULL,(LPSTR)"child_process.exe",NULL,NULL,FALSE,0,NULL,NULL,&si,&pi)) {
+        std::cerr << "CreateProcess failed: " << GetLastError() << std::endl;
+        UnmapViewOfFile(shared);
         CloseHandle(hMapFile);
+        CloseHandle(hMutex);
         return 1;
     }
-    std::cout << "Factorial of 5 is " << *pBuf << std::endl;
+
+    // Основной цикл взаимодействия
+    while (true) {
+        std::cout << "Enter a number to compute factorial (or -1 to exit): ";
+        int num;
+        std::cin >> num;
+
+        if (num == -1) {
+            WaitForSingleObject(hMutex, INFINITE);
+            shared->exit_flag = true;
+            ReleaseMutex(hMutex);
+            break;
+        }
+
+        if (num < 0) {
+            std::cout << "Number must be non-negative!" << std::endl;
+            continue;
+        }
+
+        // Отправляем данные дочернему процессу
+        WaitForSingleObject(hMutex, INFINITE);
+        shared->input = num;
+        shared->data_ready = true;
+        shared->result_ready = false;
+        ReleaseMutex(hMutex);
+
+        // Ждем результат
+        while (true) {
+            WaitForSingleObject(hMutex, INFINITE);
+            if (shared->result_ready) {
+                std::cout << "Factorial of " << num << " is " << shared->result << std::endl;
+                ReleaseMutex(hMutex);
+                break;
+            }
+            ReleaseMutex(hMutex);
+            Sleep(10);
+        }
+    }
+
+    // Ожидаем завершение дочернего процесса
+    WaitForSingleObject(pi.hProcess, INFINITE);
+
     // Освобождаем ресурсы
-    UnmapViewOfFile(pBuf);
+    UnmapViewOfFile(shared);
     CloseHandle(hMapFile);
-    CloseHandle(hThread);
+    CloseHandle(hMutex);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+
     return 0;
 }
